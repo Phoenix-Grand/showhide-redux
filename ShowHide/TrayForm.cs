@@ -71,14 +71,11 @@ namespace ShowHide
         [DllImport("user32.dll")]
         private static extern uint GetDoubleClickTime();
 
-        [DllImport("user32.dll")]
-        private static extern IntPtr WindowFromPoint(POINT Point);
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetParent(IntPtr hWnd);
-
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, ref LVHITTESTINFO lParam);
@@ -121,6 +118,15 @@ namespace ShowHide
             public int iItem;
             public int iSubItem;
             public int iGroup;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
         }
 
         // ===== Form logic =====
@@ -213,7 +219,7 @@ namespace ShowHide
 
         private static IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && wParam.ToInt32() == WM_LBUTTONDOWN)
+            if (nCode >= 0 && wParam == (IntPtr)WM_LBUTTONDOWN)
             {
                 MSLLHOOKSTRUCT data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
                 HandlePossibleDoubleClick(data);
@@ -257,8 +263,8 @@ namespace ShowHide
         }
 
         /// <summary>
-        /// Returns true only if the click is on the desktop list view AND on its background
-        /// (not on an icon, label, or state icon).
+        /// Returns true only if the click is inside the desktop list view window
+        /// AND on its background (not on an icon/label).
         /// </summary>
         private static bool IsClickOnDesktopBackground(POINT ptScreen)
         {
@@ -269,28 +275,20 @@ namespace ShowHide
                     return false;
             }
 
-            // Is the window under the cursor part of the desktop list view?
-            IntPtr hwndAtPoint = WindowFromPoint(ptScreen);
-            if (hwndAtPoint == IntPtr.Zero)
+            // Check if the point is within the desktop listview rect
+            if (!GetWindowRect(_desktopListView, out RECT rect))
                 return false;
 
-            IntPtr current = hwndAtPoint;
-            bool onDesktopListView = false;
+            bool inside =
+                ptScreen.X >= rect.Left &&
+                ptScreen.X < rect.Right &&
+                ptScreen.Y >= rect.Top &&
+                ptScreen.Y < rect.Bottom;
 
-            while (current != IntPtr.Zero)
-            {
-                if (current == _desktopListView)
-                {
-                    onDesktopListView = true;
-                    break;
-                }
-                current = GetParent(current);
-            }
-
-            if (!onDesktopListView)
+            if (!inside)
                 return false;
 
-            // We are somewhere inside the list view; now check if it's on an item or on background.
+            // Convert to client coordinates and hit-test
             POINT ptClient = ptScreen;
             if (!ScreenToClient(_desktopListView, ref ptClient))
                 return false;
@@ -304,11 +302,14 @@ namespace ShowHide
                 iGroup = 0
             };
 
-            IntPtr hitIndex = SendMessage(_desktopListView, LVM_HITTEST, IntPtr.Zero, ref info);
+            IntPtr hitIndex = SendMessage(
+                _desktopListView,
+                LVM_HITTEST,
+                new IntPtr(-1),
+                ref info);
 
-            // If hitIndex == -1 or flags do NOT indicate ONITEM, it’s background.
             bool onItem = hitIndex.ToInt32() >= 0 && (info.flags & LVHT_ONITEM) != 0;
-            return !onItem;
+            return !onItem; // background only
         }
 
         // Static entry so the hook can call it
