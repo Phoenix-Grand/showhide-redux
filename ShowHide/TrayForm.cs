@@ -7,12 +7,37 @@ namespace ShowHide
 {
     public class TrayForm : Form
     {
-        // Global hotkey id
+        // ===== Hotkey stuff =====
         private const int HOTKEY_ID = 0x1234;
+        private const uint MOD_ALT = 0x0001;
+        private const uint MOD_CONTROL = 0x0002;
+        private const int VK_D = 0x44;
+
+        // ===== Desktop show/hide =====
+        private const int SW_HIDE = 0;
+        private const int SW_SHOW = 5;
+
+        // ===== Mouse hook stuff =====
+        private const int WH_MOUSE_LL = 14;
+        private const int WM_LBUTTONDOWN = 0x0201;
+
+        private static IntPtr _mouseHook = IntPtr.Zero;
+        private static LowLevelMouseProc _mouseProc;   // keep delegate alive
+
+        private static IntPtr _desktopListView = IntPtr.Zero;
+        private static uint _doubleClickTime = 0;
+        private static uint _lastClickTime = 0;
+        private static POINT _lastClickPoint;
+
+        // consider clicks within this distance to be the "same spot"
+        private const int DOUBLE_CLICK_MAX_DISTANCE = 4; // pixels
+
+        // Tray UI
         private NotifyIcon _trayIcon;
         private ContextMenuStrip _menu;
 
-        // Win32 interop
+        // ==== Win32 interop ====
+
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
 
@@ -20,23 +45,85 @@ namespace ShowHide
         private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
         [DllImport("user32.dll", SetLastError = true)]
-        static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+        private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
 
         [DllImport("user32.dll", SetLastError = true)]
-        static extern IntPtr FindWindowEx(IntPtr parentHandle, IntPtr childAfter, string lclassName, string windowTitle);
+        private static extern IntPtr FindWindowEx(IntPtr parentHandle, IntPtr childAfter, string lclassName, string windowTitle);
 
         [DllImport("user32.dll", SetLastError = true)]
-        static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
         [DllImport("user32.dll", SetLastError = true)]
-        static extern bool IsWindowVisible(IntPtr hWnd);
+        private static extern bool IsWindowVisible(IntPtr hWnd);
 
-        private const uint MOD_ALT = 0x0001;
-        private const uint MOD_CONTROL = 0x0002;
-        private const int VK_D = 0x44;
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
 
-        private const int SW_HIDE = 0;
-        private const int SW_SHOW = 5;
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetDoubleClickTime();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(POINT Point);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetParent(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, ref LVHITTESTINFO lParam);
+
+        // ListView hit-test stuff
+        private const uint LVM_FIRST = 0x1000;
+        private const uint LVM_HITTEST = LVM_FIRST + 18;
+
+        private const uint LVHT_ONITEMICON = 0x0002;
+        private const uint LVHT_ONITEMLABEL = 0x0004;
+        private const uint LVHT_ONITEMSTATEICON = 0x0008;
+        private const uint LVHT_ONITEM = LVHT_ONITEMICON | LVHT_ONITEMLABEL | LVHT_ONITEMSTATEICON;
+
+        // structs / delegates
+
+        private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSLLHOOKSTRUCT
+        {
+            public POINT pt;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LVHITTESTINFO
+        {
+            public POINT pt;
+            public uint flags;
+            public int iItem;
+            public int iSubItem;
+            public int iGroup;
+        }
+
+        // ===== Form logic =====
 
         public TrayForm()
         {
@@ -70,14 +157,36 @@ namespace ShowHide
             bool ok = RegisterHotKey(Handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_D);
             if (!ok)
             {
-                MessageBox.Show("Could not register hotkey Ctrl+Alt+D.", "ShowHide", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Could not register hotkey Ctrl+Alt+D.", "ShowHide",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
+
+            // Setup mouse hook for desktop double-click
+            _mouseProc = MouseHookCallback;
+            IntPtr hModule = GetModuleHandle(null);
+            _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hModule, 0);
+
+            if (_mouseHook == IntPtr.Zero)
+            {
+                MessageBox.Show("Could not install mouse hook.", "ShowHide",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+
+            // Get double-click time from system
+            _doubleClickTime = GetDoubleClickTime();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             // Unregister hotkey
             UnregisterHotKey(Handle, HOTKEY_ID);
+
+            // Unhook mouse
+            if (_mouseHook != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_mouseHook);
+                _mouseHook = IntPtr.Zero;
+            }
 
             if (_trayIcon != null)
             {
@@ -100,12 +209,135 @@ namespace ShowHide
             base.WndProc(ref m);
         }
 
+        // ===== Mouse hook callback =====
+
+        private static IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && wParam.ToInt32() == WM_LBUTTONDOWN)
+            {
+                MSLLHOOKSTRUCT data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                HandlePossibleDoubleClick(data);
+            }
+
+            return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+        }
+
+        private static void HandlePossibleDoubleClick(MSLLHOOKSTRUCT data)
+        {
+            if (_doubleClickTime == 0)
+                _doubleClickTime = GetDoubleClickTime();
+
+            uint now = data.time;
+            POINT currentPoint = data.pt;
+
+            bool isWithinTime = (now - _lastClickTime) <= _doubleClickTime;
+            bool isWithinDistance = DistanceSquared(currentPoint, _lastClickPoint)
+                                    <= DOUBLE_CLICK_MAX_DISTANCE * DOUBLE_CLICK_MAX_DISTANCE;
+
+            if (isWithinTime && isWithinDistance && IsClickOnDesktopBackground(currentPoint))
+            {
+                // It's a double-click on the empty desktop background → toggle icons
+                ToggleIconsStatic();
+                // Reset to avoid triple-click toggling twice
+                _lastClickTime = 0;
+            }
+            else
+            {
+                // Store current click as the last click
+                _lastClickTime = now;
+                _lastClickPoint = currentPoint;
+            }
+        }
+
+        private static int DistanceSquared(POINT a, POINT b)
+        {
+            int dx = a.X - b.X;
+            int dy = a.Y - b.Y;
+            return dx * dx + dy * dy;
+        }
+
+        /// <summary>
+        /// Returns true only if the click is on the desktop list view AND on its background
+        /// (not on an icon, label, or state icon).
+        /// </summary>
+        private static bool IsClickOnDesktopBackground(POINT ptScreen)
+        {
+            if (_desktopListView == IntPtr.Zero)
+            {
+                _desktopListView = GetDesktopListViewHandle();
+                if (_desktopListView == IntPtr.Zero)
+                    return false;
+            }
+
+            // Is the window under the cursor part of the desktop list view?
+            IntPtr hwndAtPoint = WindowFromPoint(ptScreen);
+            if (hwndAtPoint == IntPtr.Zero)
+                return false;
+
+            IntPtr current = hwndAtPoint;
+            bool onDesktopListView = false;
+
+            while (current != IntPtr.Zero)
+            {
+                if (current == _desktopListView)
+                {
+                    onDesktopListView = true;
+                    break;
+                }
+                current = GetParent(current);
+            }
+
+            if (!onDesktopListView)
+                return false;
+
+            // We are somewhere inside the list view; now check if it's on an item or on background.
+            POINT ptClient = ptScreen;
+            if (!ScreenToClient(_desktopListView, ref ptClient))
+                return false;
+
+            LVHITTESTINFO info = new LVHITTESTINFO
+            {
+                pt = ptClient,
+                flags = 0,
+                iItem = -1,
+                iSubItem = 0,
+                iGroup = 0
+            };
+
+            IntPtr hitIndex = SendMessage(_desktopListView, LVM_HITTEST, IntPtr.Zero, ref info);
+
+            // If hitIndex == -1 or flags do NOT indicate ONITEM, it’s background.
+            bool onItem = hitIndex.ToInt32() >= 0 && (info.flags & LVHT_ONITEM) != 0;
+            return !onItem;
+        }
+
+        // Static entry so the hook can call it
+        private static void ToggleIconsStatic()
+        {
+            IntPtr lv = _desktopListView;
+            if (lv == IntPtr.Zero)
+            {
+                lv = GetDesktopListViewHandle();
+                _desktopListView = lv;
+            }
+
+            if (lv == IntPtr.Zero)
+                return;
+
+            bool visible = IsWindowVisible(lv);
+            ShowWindow(lv, visible ? SW_HIDE : SW_SHOW);
+        }
+
+        // Instance helper used by tray & hotkey
         private void ToggleDesktopIcons()
         {
             IntPtr desktopListView = GetDesktopListViewHandle();
+            _desktopListView = desktopListView; // cache for hook
+
             if (desktopListView == IntPtr.Zero)
             {
-                MessageBox.Show("Could not find desktop icons window.", "ShowHide", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("Could not find desktop icons window.", "ShowHide",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
 
@@ -116,7 +348,7 @@ namespace ShowHide
         /// <summary>
         /// Gets the handle of the SysListView32 that actually hosts the desktop icons.
         /// </summary>
-        private IntPtr GetDesktopListViewHandle()
+        private static IntPtr GetDesktopListViewHandle()
         {
             // Step 1: Get the "Progman" window.
             IntPtr progman = FindWindow("Progman", null);
