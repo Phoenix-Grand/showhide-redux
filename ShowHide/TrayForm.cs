@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using System.Drawing;
@@ -80,6 +81,12 @@ namespace ShowHide
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, ref LVHITTESTINFO lParam);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(POINT pt);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetParent(IntPtr hWnd);
+
         // ListView hit-test stuff
         private const uint LVM_FIRST = 0x1000;
         private const uint LVM_HITTEST = LVM_FIRST + 18;
@@ -159,6 +166,9 @@ namespace ShowHide
         {
             base.OnLoad(e);
 
+            // Get desktop listview right away (hotkey already proves this works)
+            _desktopListView = GetDesktopListViewHandle();
+
             // Register Ctrl+Alt+D as the toggle hotkey
             bool ok = RegisterHotKey(Handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_D);
             if (!ok)
@@ -169,8 +179,13 @@ namespace ShowHide
 
             // Setup mouse hook for desktop double-click
             _mouseProc = MouseHookCallback;
-            IntPtr hModule = GetModuleHandle(null);
-            _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hModule, 0);
+
+            using (Process curProcess = Process.GetCurrentProcess())
+            using (ProcessModule curModule = curProcess.MainModule!)
+            {
+                IntPtr hModule = GetModuleHandle(curModule.ModuleName);
+                _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hModule, 0);
+            }
 
             if (_mouseHook == IntPtr.Zero)
             {
@@ -205,9 +220,9 @@ namespace ShowHide
 
         protected override void WndProc(ref Message m)
         {
-            const int WM_HOTKEY = 0x0312;
+            const int WM_HOTKEY_MSG = 0x0312;
 
-            if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
+            if (m.Msg == WM_HOTKEY_MSG && m.WParam.ToInt32() == HOTKEY_ID)
             {
                 ToggleDesktopIcons();
             }
@@ -275,7 +290,7 @@ namespace ShowHide
                     return false;
             }
 
-            // Check if the point is within the desktop listview rect
+            // 1) Check if point is within desktop listview rectangle
             if (!GetWindowRect(_desktopListView, out RECT rect))
                 return false;
 
@@ -288,11 +303,12 @@ namespace ShowHide
             if (!inside)
                 return false;
 
-            // Convert to client coordinates and hit-test
+            // 2) Convert to client coordinates
             POINT ptClient = ptScreen;
             if (!ScreenToClient(_desktopListView, ref ptClient))
                 return false;
 
+            // 3) Hit-test the list view
             LVHITTESTINFO info = new LVHITTESTINFO
             {
                 pt = ptClient,
@@ -305,7 +321,7 @@ namespace ShowHide
             IntPtr hitIndex = SendMessage(
                 _desktopListView,
                 LVM_HITTEST,
-                new IntPtr(-1),
+                IntPtr.Zero,      // wParam = 0 for normal hit-test
                 ref info);
 
             bool onItem = hitIndex.ToInt32() >= 0 && (info.flags & LVHT_ONITEM) != 0;
