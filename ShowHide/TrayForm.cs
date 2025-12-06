@@ -62,6 +62,24 @@ namespace ShowHide
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool GetCursorPos(out POINT lpPoint);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, ref LVHITTESTINFO lParam);
+
+        // ListView hit-test stuff
+        private const uint LVM_FIRST = 0x1000;
+        private const uint LVM_HITTEST = LVM_FIRST + 18;
+
+        private const uint LVHT_ONITEMICON = 0x0002;
+        private const uint LVHT_ONITEMLABEL = 0x0004;
+        private const uint LVHT_ONITEMSTATEICON = 0x0008;
+        private const uint LVHT_ONITEM = LVHT_ONITEMICON | LVHT_ONITEMLABEL | LVHT_ONITEMSTATEICON;
+
         // structs
 
         [StructLayout(LayoutKind.Sequential)]
@@ -69,6 +87,25 @@ namespace ShowHide
         {
             public int X;
             public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LVHITTESTINFO
+        {
+            public POINT pt;
+            public uint flags;
+            public int iItem;
+            public int iSubItem;
+            public int iGroup;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
         }
 
         // ===== Form logic =====
@@ -108,7 +145,7 @@ namespace ShowHide
         {
             base.OnLoad(e);
 
-            // Get desktop listview right away (we know this works because hotkey works)
+            // Get desktop listview right away
             _desktopListView = GetDesktopListViewHandle();
 
             // Register Ctrl+Alt+D as the toggle hotkey
@@ -190,9 +227,9 @@ namespace ShowHide
             bool isWithinDistance = DistanceSquared(ptScreen, _lastClickPoint)
                                     <= DOUBLE_CLICK_MAX_DISTANCE * DOUBLE_CLICK_MAX_DISTANCE;
 
-            if (isWithinTime && isWithinDistance)
+            if (isWithinTime && isWithinDistance && IsClickOnDesktopBackground(ptScreen))
             {
-                // Double-click ANYWHERE → toggle icons
+                // Double-click on empty desktop background
                 ToggleIconsStatic();
                 _lastClickTime = 0; // reset
             }
@@ -208,6 +245,57 @@ namespace ShowHide
             int dx = a.X - b.X;
             int dy = a.Y - b.Y;
             return dx * dx + dy * dy;
+        }
+
+        /// <summary>
+        /// Returns true only if the click is inside the desktop list view window
+        /// AND on its background (not on an icon/label).
+        /// </summary>
+        private static bool IsClickOnDesktopBackground(POINT ptScreen)
+        {
+            if (_desktopListView == IntPtr.Zero)
+            {
+                _desktopListView = GetDesktopListViewHandle();
+                if (_desktopListView == IntPtr.Zero)
+                    return false;
+            }
+
+            // 1) Check if point is within desktop listview rectangle
+            if (!GetWindowRect(_desktopListView, out RECT rect))
+                return false;
+
+            bool inside =
+                ptScreen.X >= rect.Left &&
+                ptScreen.X < rect.Right &&
+                ptScreen.Y >= rect.Top &&
+                ptScreen.Y < rect.Bottom;
+
+            if (!inside)
+                return false;
+
+            // 2) Convert to client coordinates
+            POINT ptClient = ptScreen;
+            if (!ScreenToClient(_desktopListView, ref ptClient))
+                return false;
+
+            // 3) Hit-test the list view
+            LVHITTESTINFO info = new LVHITTESTINFO
+            {
+                pt = ptClient,
+                flags = 0,
+                iItem = -1,
+                iSubItem = 0,
+                iGroup = 0
+            };
+
+            IntPtr hitIndex = SendMessage(
+                _desktopListView,
+                LVM_HITTEST,
+                IntPtr.Zero,
+                ref info);
+
+            bool onItem = hitIndex.ToInt32() >= 0 && (info.flags & LVHT_ONITEM) != 0;
+            return !onItem; // background only
         }
 
         // Static entry for polling logic
