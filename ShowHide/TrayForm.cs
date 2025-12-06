@@ -17,20 +17,17 @@ namespace ShowHide
         private const int SW_HIDE = 0;
         private const int SW_SHOW = 5;
 
-        // ===== Mouse hook stuff =====
-        private const int WH_MOUSE_LL = 14;
-        private const int WM_LBUTTONDOWN = 0x0201;
-
-        private static IntPtr _mouseHook = IntPtr.Zero;
-        private static LowLevelMouseProc _mouseProc;   // keep delegate alive
-
-        private static IntPtr _desktopListView = IntPtr.Zero;
-        private static uint _doubleClickTime = 0;
-        private static uint _lastClickTime = 0;
-        private static POINT _lastClickPoint;
-
-        // consider clicks within this distance to be the "same spot"
+        // ===== Mouse polling stuff =====
+        private const int VK_LBUTTON = 0x01;
         private const int DOUBLE_CLICK_MAX_DISTANCE = 4; // pixels
+
+        private Timer _mouseTimer;
+        private bool _wasLeftDown = false;
+        private int _lastClickTime = 0;
+        private POINT _lastClickPoint;
+
+        private static uint _doubleClickTime = 0;
+        private static IntPtr _desktopListView = IntPtr.Zero;
 
         // Tray UI
         private NotifyIcon _trayIcon;
@@ -56,30 +53,34 @@ namespace ShowHide
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool IsWindowVisible(IntPtr hWnd);
 
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern IntPtr GetModuleHandle(string lpModuleName);
-
         [DllImport("user32.dll")]
         private static extern uint GetDoubleClickTime();
 
         [DllImport("user32.dll")]
-        private static extern IntPtr WindowFromPoint(POINT Point);
+        private static extern short GetAsyncKeyState(int vKey);
 
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetParent(IntPtr hWnd);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetCursorPos(out POINT lpPoint);
 
-        // structs / delegates
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
-        private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, ref LVHITTESTINFO lParam);
+
+        // ListView hit-test stuff
+        private const uint LVM_FIRST = 0x1000;
+        private const uint LVM_HITTEST = LVM_FIRST + 18;
+
+        private const uint LVHT_ONITEMICON = 0x0002;
+        private const uint LVHT_ONITEMLABEL = 0x0004;
+        private const uint LVHT_ONITEMSTATEICON = 0x0008;
+        private const uint LVHT_ONITEM = LVHT_ONITEMICON | LVHT_ONITEMLABEL | LVHT_ONITEMSTATEICON;
+
+        // structs
 
         [StructLayout(LayoutKind.Sequential)]
         private struct POINT
@@ -89,13 +90,22 @@ namespace ShowHide
         }
 
         [StructLayout(LayoutKind.Sequential)]
-        private struct MSLLHOOKSTRUCT
+        private struct LVHITTESTINFO
         {
             public POINT pt;
-            public uint mouseData;
             public uint flags;
-            public uint time;
-            public IntPtr dwExtraInfo;
+            public int iItem;
+            public int iSubItem;
+            public int iGroup;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
         }
 
         // ===== Form logic =====
@@ -122,11 +132,21 @@ namespace ShowHide
             };
 
             _trayIcon.DoubleClick += (s, e) => ToggleDesktopIcons();
+
+            // Mouse polling timer
+            _mouseTimer = new Timer
+            {
+                Interval = 20 // ms
+            };
+            _mouseTimer.Tick += MouseTimer_Tick;
         }
 
         protected override void OnLoad(EventArgs e)
         {
             base.OnLoad(e);
+
+            // Get desktop listview right away
+            _desktopListView = GetDesktopListViewHandle();
 
             // Register Ctrl+Alt+D as the toggle hotkey
             bool ok = RegisterHotKey(Handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_D);
@@ -136,19 +156,13 @@ namespace ShowHide
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
 
-            // Setup mouse hook for desktop double-click
-            _mouseProc = MouseHookCallback;
-            IntPtr hModule = GetModuleHandle(null);
-            _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hModule, 0);
-
-            if (_mouseHook == IntPtr.Zero)
-            {
-                MessageBox.Show("Could not install mouse hook.", "ShowHide",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-
             // Get double-click time from system
             _doubleClickTime = GetDoubleClickTime();
+            if (_doubleClickTime == 0)
+                _doubleClickTime = 500; // fallback
+
+            // Start polling mouse
+            _mouseTimer.Start();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -156,11 +170,12 @@ namespace ShowHide
             // Unregister hotkey
             UnregisterHotKey(Handle, HOTKEY_ID);
 
-            // Unhook mouse
-            if (_mouseHook != IntPtr.Zero)
+            // Stop timer
+            if (_mouseTimer != null)
             {
-                UnhookWindowsHookEx(_mouseHook);
-                _mouseHook = IntPtr.Zero;
+                _mouseTimer.Stop();
+                _mouseTimer.Tick -= MouseTimer_Tick;
+                _mouseTimer.Dispose();
             }
 
             if (_trayIcon != null)
@@ -174,9 +189,9 @@ namespace ShowHide
 
         protected override void WndProc(ref Message m)
         {
-            const int WM_HOTKEY = 0x0312;
+            const int WM_HOTKEY_MSG = 0x0312;
 
-            if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
+            if (m.Msg == WM_HOTKEY_MSG && m.WParam.ToInt32() == HOTKEY_ID)
             {
                 ToggleDesktopIcons();
             }
@@ -184,43 +199,44 @@ namespace ShowHide
             base.WndProc(ref m);
         }
 
-        // ===== Mouse hook callback =====
+        // ===== Mouse polling logic =====
 
-        private static IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        private void MouseTimer_Tick(object? sender, EventArgs e)
         {
-            if (nCode >= 0 && wParam.ToInt32() == WM_LBUTTONDOWN)
+            // High bit of GetAsyncKeyState means key currently down
+            bool isDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+
+            if (isDown && !_wasLeftDown)
             {
-                MSLLHOOKSTRUCT data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-                HandlePossibleDoubleClick(data);
+                // This is a new left-click press
+                OnLeftClick();
             }
 
-            return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+            _wasLeftDown = isDown;
         }
 
-        private static void HandlePossibleDoubleClick(MSLLHOOKSTRUCT data)
+        private void OnLeftClick()
         {
-            if (_doubleClickTime == 0)
-                _doubleClickTime = GetDoubleClickTime();
+            // Get current cursor position
+            if (!GetCursorPos(out POINT ptScreen))
+                return;
 
-            uint now = data.time;
-            POINT currentPoint = data.pt;
-
-            bool isWithinTime = (now - _lastClickTime) <= _doubleClickTime;
-            bool isWithinDistance = DistanceSquared(currentPoint, _lastClickPoint)
+            int now = Environment.TickCount;
+            bool isWithinTime = (now - _lastClickTime) >= 0 &&
+                                (now - _lastClickTime) <= _doubleClickTime;
+            bool isWithinDistance = DistanceSquared(ptScreen, _lastClickPoint)
                                     <= DOUBLE_CLICK_MAX_DISTANCE * DOUBLE_CLICK_MAX_DISTANCE;
 
-            if (isWithinTime && isWithinDistance && IsClickOnDesktop(currentPoint))
+            if (isWithinTime && isWithinDistance && IsClickOnDesktopBackground(ptScreen))
             {
-                // It's a double-click on the desktop → toggle icons
+                // Double-click on empty desktop background
                 ToggleIconsStatic();
-                // Reset to avoid triple-click toggling twice
-                _lastClickTime = 0;
+                _lastClickTime = 0; // reset
             }
             else
             {
-                // Store current click as the last click
                 _lastClickTime = now;
-                _lastClickPoint = currentPoint;
+                _lastClickPoint = ptScreen;
             }
         }
 
@@ -231,7 +247,11 @@ namespace ShowHide
             return dx * dx + dy * dy;
         }
 
-        private static bool IsClickOnDesktop(POINT pt)
+        /// <summary>
+        /// Returns true only if the click is inside the desktop list view window
+        /// AND on its background (not on an icon/label).
+        /// </summary>
+        private static bool IsClickOnDesktopBackground(POINT ptScreen)
         {
             if (_desktopListView == IntPtr.Zero)
             {
@@ -240,28 +260,46 @@ namespace ShowHide
                     return false;
             }
 
-            IntPtr hwndAtPoint = WindowFromPoint(pt);
-            if (hwndAtPoint == IntPtr.Zero)
+            if (!GetWindowRect(_desktopListView, out RECT rect))
                 return false;
 
-            // Walk up the parent chain to see if we land on the desktop list view
-            IntPtr current = hwndAtPoint;
-            while (current != IntPtr.Zero)
+            bool inside =
+                ptScreen.X >= rect.Left &&
+                ptScreen.X < rect.Right &&
+                ptScreen.Y >= rect.Top &&
+                ptScreen.Y < rect.Bottom;
+
+            if (!inside)
+                return false;
+
+            // Convert to client coordinates
+            POINT ptClient = ptScreen;
+            if (!ScreenToClient(_desktopListView, ref ptClient))
+                return false;
+
+            // Hit-test the list view
+            LVHITTESTINFO info = new LVHITTESTINFO
             {
-                if (current == _desktopListView)
-                    return true;
+                pt = ptClient,
+                flags = 0,
+                iItem = -1,
+                iSubItem = 0,
+                iGroup = 0
+            };
 
-                current = GetParent(current);
-            }
+            IntPtr hitIndex = SendMessage(
+                _desktopListView,
+                LVM_HITTEST,
+                IntPtr.Zero,
+                ref info);
 
-            return false;
+            bool onItem = hitIndex.ToInt32() >= 0 && (info.flags & LVHT_ONITEM) != 0;
+            return !onItem; // background only
         }
 
-        // Static entry so the hook can call it
+        // Static entry for polling logic
         private static void ToggleIconsStatic()
         {
-            // We need an instance method to interact with UI (MessageBox etc.)
-            // but the core toggling is static-friendly.
             IntPtr lv = _desktopListView;
             if (lv == IntPtr.Zero)
             {
@@ -280,7 +318,7 @@ namespace ShowHide
         private void ToggleDesktopIcons()
         {
             IntPtr desktopListView = GetDesktopListViewHandle();
-            _desktopListView = desktopListView; // cache for hook
+            _desktopListView = desktopListView; // cache
 
             if (desktopListView == IntPtr.Zero)
             {
