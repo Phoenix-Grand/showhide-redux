@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using System.Drawing;
@@ -72,29 +71,11 @@ namespace ShowHide
         [DllImport("user32.dll")]
         private static extern uint GetDoubleClickTime();
 
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, ref LVHITTESTINFO lParam);
-
         [DllImport("user32.dll")]
-        private static extern IntPtr WindowFromPoint(POINT pt);
+        private static extern IntPtr WindowFromPoint(POINT Point);
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetParent(IntPtr hWnd);
-
-        // ListView hit-test stuff
-        private const uint LVM_FIRST = 0x1000;
-        private const uint LVM_HITTEST = LVM_FIRST + 18;
-
-        private const uint LVHT_ONITEMICON = 0x0002;
-        private const uint LVHT_ONITEMLABEL = 0x0004;
-        private const uint LVHT_ONITEMSTATEICON = 0x0008;
-        private const uint LVHT_ONITEM = LVHT_ONITEMICON | LVHT_ONITEMLABEL | LVHT_ONITEMSTATEICON;
 
         // structs / delegates
 
@@ -115,25 +96,6 @@ namespace ShowHide
             public uint flags;
             public uint time;
             public IntPtr dwExtraInfo;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct LVHITTESTINFO
-        {
-            public POINT pt;
-            public uint flags;
-            public int iItem;
-            public int iSubItem;
-            public int iGroup;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct RECT
-        {
-            public int Left;
-            public int Top;
-            public int Right;
-            public int Bottom;
         }
 
         // ===== Form logic =====
@@ -166,9 +128,6 @@ namespace ShowHide
         {
             base.OnLoad(e);
 
-            // Get desktop listview right away (hotkey already proves this works)
-            _desktopListView = GetDesktopListViewHandle();
-
             // Register Ctrl+Alt+D as the toggle hotkey
             bool ok = RegisterHotKey(Handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_D);
             if (!ok)
@@ -179,13 +138,8 @@ namespace ShowHide
 
             // Setup mouse hook for desktop double-click
             _mouseProc = MouseHookCallback;
-
-            using (Process curProcess = Process.GetCurrentProcess())
-            using (ProcessModule curModule = curProcess.MainModule!)
-            {
-                IntPtr hModule = GetModuleHandle(curModule.ModuleName);
-                _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hModule, 0);
-            }
+            IntPtr hModule = GetModuleHandle(null);
+            _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hModule, 0);
 
             if (_mouseHook == IntPtr.Zero)
             {
@@ -220,9 +174,9 @@ namespace ShowHide
 
         protected override void WndProc(ref Message m)
         {
-            const int WM_HOTKEY_MSG = 0x0312;
+            const int WM_HOTKEY = 0x0312;
 
-            if (m.Msg == WM_HOTKEY_MSG && m.WParam.ToInt32() == HOTKEY_ID)
+            if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
             {
                 ToggleDesktopIcons();
             }
@@ -234,7 +188,7 @@ namespace ShowHide
 
         private static IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && wParam == (IntPtr)WM_LBUTTONDOWN)
+            if (nCode >= 0 && wParam.ToInt32() == WM_LBUTTONDOWN)
             {
                 MSLLHOOKSTRUCT data = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
                 HandlePossibleDoubleClick(data);
@@ -255,9 +209,9 @@ namespace ShowHide
             bool isWithinDistance = DistanceSquared(currentPoint, _lastClickPoint)
                                     <= DOUBLE_CLICK_MAX_DISTANCE * DOUBLE_CLICK_MAX_DISTANCE;
 
-            if (isWithinTime && isWithinDistance && IsClickOnDesktopBackground(currentPoint))
+            if (isWithinTime && isWithinDistance && IsClickOnDesktop(currentPoint))
             {
-                // It's a double-click on the empty desktop background → toggle icons
+                // It's a double-click on the desktop → toggle icons
                 ToggleIconsStatic();
                 // Reset to avoid triple-click toggling twice
                 _lastClickTime = 0;
@@ -277,11 +231,7 @@ namespace ShowHide
             return dx * dx + dy * dy;
         }
 
-        /// <summary>
-        /// Returns true only if the click is inside the desktop list view window
-        /// AND on its background (not on an icon/label).
-        /// </summary>
-        private static bool IsClickOnDesktopBackground(POINT ptScreen)
+        private static bool IsClickOnDesktop(POINT pt)
         {
             if (_desktopListView == IntPtr.Zero)
             {
@@ -290,47 +240,28 @@ namespace ShowHide
                     return false;
             }
 
-            // 1) Check if point is within desktop listview rectangle
-            if (!GetWindowRect(_desktopListView, out RECT rect))
+            IntPtr hwndAtPoint = WindowFromPoint(pt);
+            if (hwndAtPoint == IntPtr.Zero)
                 return false;
 
-            bool inside =
-                ptScreen.X >= rect.Left &&
-                ptScreen.X < rect.Right &&
-                ptScreen.Y >= rect.Top &&
-                ptScreen.Y < rect.Bottom;
-
-            if (!inside)
-                return false;
-
-            // 2) Convert to client coordinates
-            POINT ptClient = ptScreen;
-            if (!ScreenToClient(_desktopListView, ref ptClient))
-                return false;
-
-            // 3) Hit-test the list view
-            LVHITTESTINFO info = new LVHITTESTINFO
+            // Walk up the parent chain to see if we land on the desktop list view
+            IntPtr current = hwndAtPoint;
+            while (current != IntPtr.Zero)
             {
-                pt = ptClient,
-                flags = 0,
-                iItem = -1,
-                iSubItem = 0,
-                iGroup = 0
-            };
+                if (current == _desktopListView)
+                    return true;
 
-            IntPtr hitIndex = SendMessage(
-                _desktopListView,
-                LVM_HITTEST,
-                IntPtr.Zero,      // wParam = 0 for normal hit-test
-                ref info);
+                current = GetParent(current);
+            }
 
-            bool onItem = hitIndex.ToInt32() >= 0 && (info.flags & LVHT_ONITEM) != 0;
-            return !onItem; // background only
+            return false;
         }
 
         // Static entry so the hook can call it
         private static void ToggleIconsStatic()
         {
+            // We need an instance method to interact with UI (MessageBox etc.)
+            // but the core toggling is static-friendly.
             IntPtr lv = _desktopListView;
             if (lv == IntPtr.Zero)
             {
