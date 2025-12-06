@@ -62,23 +62,21 @@ namespace ShowHide
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool GetCursorPos(out POINT lpPoint);
 
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+        // NEW: needed to know what window is under the cursor
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(POINT Point);
 
+        // NEW: convert screen -> client coordinates for the listview
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
 
+        // NEW: SendMessage for listview hit testing
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, ref LVHITTESTINFO lParam);
 
-        // ListView hit-test stuff
+        // ListView messages
         private const uint LVM_FIRST = 0x1000;
         private const uint LVM_HITTEST = LVM_FIRST + 18;
-
-        private const uint LVHT_ONITEMICON = 0x0002;
-        private const uint LVHT_ONITEMLABEL = 0x0004;
-        private const uint LVHT_ONITEMSTATEICON = 0x0008;
-        private const uint LVHT_ONITEM = LVHT_ONITEMICON | LVHT_ONITEMLABEL | LVHT_ONITEMSTATEICON;
 
         // structs
 
@@ -89,6 +87,7 @@ namespace ShowHide
             public int Y;
         }
 
+        // NEW: for LVM_HITTEST
         [StructLayout(LayoutKind.Sequential)]
         private struct LVHITTESTINFO
         {
@@ -96,16 +95,6 @@ namespace ShowHide
             public uint flags;
             public int iItem;
             public int iSubItem;
-            public int iGroup;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct RECT
-        {
-            public int Left;
-            public int Top;
-            public int Right;
-            public int Bottom;
         }
 
         // ===== Form logic =====
@@ -227,11 +216,14 @@ namespace ShowHide
             bool isWithinDistance = DistanceSquared(ptScreen, _lastClickPoint)
                                     <= DOUBLE_CLICK_MAX_DISTANCE * DOUBLE_CLICK_MAX_DISTANCE;
 
-            if (isWithinTime && isWithinDistance && IsClickOnDesktopBackground(ptScreen))
+            if (isWithinTime && isWithinDistance)
             {
-                // Double-click on empty desktop background
-                ToggleIconsStatic();
-                _lastClickTime = 0; // reset
+                // NEW: Only toggle if it's a double-click on EMPTY desktop background
+                if (IsDoubleClickOnEmptyDesktop(ptScreen))
+                {
+                    ToggleIconsStatic();
+                }
+                _lastClickTime = 0; // reset (regardless)
             }
             else
             {
@@ -247,55 +239,46 @@ namespace ShowHide
             return dx * dx + dy * dy;
         }
 
-        /// <summary>
-        /// Returns true only if the click is inside the desktop list view window
-        /// AND on its background (not on an icon/label).
-        /// </summary>
-        private static bool IsClickOnDesktopBackground(POINT ptScreen)
+        // NEW: check that the double-click is on the desktop listview AND not on an item
+        private static bool IsDoubleClickOnEmptyDesktop(POINT screenPoint)
         {
-            if (_desktopListView == IntPtr.Zero)
+            // Ensure we have the desktop listview
+            IntPtr lv = _desktopListView;
+            if (lv == IntPtr.Zero)
             {
-                _desktopListView = GetDesktopListViewHandle();
-                if (_desktopListView == IntPtr.Zero)
-                    return false;
+                lv = GetDesktopListViewHandle();
+                _desktopListView = lv;
             }
 
-            // 1) Check if point is within desktop listview rectangle
-            if (!GetWindowRect(_desktopListView, out RECT rect))
+            if (lv == IntPtr.Zero)
                 return false;
 
-            bool inside =
-                ptScreen.X >= rect.Left &&
-                ptScreen.X < rect.Right &&
-                ptScreen.Y >= rect.Top &&
-                ptScreen.Y < rect.Bottom;
+            // Confirm the window under the cursor is the desktop listview
+            IntPtr hwndAtPoint = WindowFromPoint(screenPoint);
+            if (hwndAtPoint != lv)
+            {
+                // Not even on the desktop listview → ignore
+                return false;
+            }
 
-            if (!inside)
+            // Convert to listview client coordinates
+            POINT ptClient = screenPoint;
+            if (!ScreenToClient(lv, ref ptClient))
                 return false;
 
-            // 2) Convert to client coordinates
-            POINT ptClient = ptScreen;
-            if (!ScreenToClient(_desktopListView, ref ptClient))
-                return false;
-
-            // 3) Hit-test the list view
-            LVHITTESTINFO info = new LVHITTESTINFO
+            // Hit-test the listview to see if there's an item under the cursor
+            LVHITTESTINFO ht = new LVHITTESTINFO
             {
                 pt = ptClient,
                 flags = 0,
                 iItem = -1,
-                iSubItem = 0,
-                iGroup = 0
+                iSubItem = 0
             };
 
-            IntPtr hitIndex = SendMessage(
-                _desktopListView,
-                LVM_HITTEST,
-                IntPtr.Zero,
-                ref info);
+            SendMessage(lv, LVM_HITTEST, IntPtr.Zero, ref ht);
 
-            bool onItem = hitIndex.ToInt32() >= 0 && (info.flags & LVHT_ONITEM) != 0;
-            return !onItem; // background only
+            // iItem == -1 -> no icon under cursor = empty background
+            return ht.iItem == -1;
         }
 
         // Static entry for polling logic
